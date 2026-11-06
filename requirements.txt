@@ -1,0 +1,4 @@
+# ViralForge bağımlılıkları (hepsi ücretsiz)
+edge-tts>=6.1.0          # seslendirme (ücretsiz TTS)
+faster-whisper>=1.0.0    # altyazı (offline Whisper, CPU)
+pillow>=10.0.0           # görsel yardımcı işlemler
