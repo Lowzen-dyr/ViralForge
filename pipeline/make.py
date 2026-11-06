@@ -12,8 +12,8 @@ ViralForge — gerçekten çalışan TikTok video üretim pipeline'ı.
   7. publish → otomasyon RİSKLİDİR: videoyu elle yüklemeyi önerir (metadata hazır)
 
 Kullanım:
-  python pipeline/make.py --topic "gece rutinleri" [--voice tr-TR-AhmetNeural]
-                          [--dry-run] [--keep-open]
+  python pipeline/make.py --topic "gece rutinleri" [--subtitle-style karaoke_pop]
+                          [--dry-run]
 
 Gereksinim: ffmpeg, edge-tts, pillow (install.sh hepsini kurar)
 """
@@ -66,6 +66,11 @@ def http_get(url: str, dest: Path, dry: bool, tries: int = 3) -> None:
             print(f"  deneme {i + 1}/{tries} başarısız: {e}")
             time.sleep(3)
     raise RuntimeError(f"İndirilemedi: {url}")
+
+
+def ffmpeg_escape(path: Path) -> str:
+    """ffmpeg filtre argümanı içinde kullanmak için dosya yolunu escape eder."""
+    return str(path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
 
 
 # ---------------------------------------------------------------- 1) senaryo
@@ -178,7 +183,7 @@ def gen_video(cover: Path, mp3: Path, srt: Path, subtitle_style: str, dry: bool)
                          "OutlineColour=&H00000000,Outline=3,Bold=1,Alignment=2,MarginV=60",
     }
     style = styles.get(subtitle_style, styles["karaoke_pop"])
-    vf = f"subtitles={srt.name}:force_style='{style}'"
+    vf = f"subtitles={ffmpeg_escape(srt)}:force_style='{style}'"
     sh(["ffmpeg", "-y", "-i", str(raw), "-vf", vf,
         "-c:v", "libx264", "-preset", "fast", "-c:a", "copy", str(final)], dry)
     print(f"[5] altyazı gömüldü: {final.name} (stil: {subtitle_style})")
