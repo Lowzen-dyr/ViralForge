@@ -1,0 +1,71 @@
+{
+  "animation_templates": [
+    {
+      "id": "kinetic_text",
+      "name": "Kinetic Text Pop",
+      "description": "Sözcük sözcük beliren, ölçek+opaklık animasyonlu altyazı metni",
+      "engine": "remotion",
+      "duration_per_word_ms": 260,
+      "params": {
+        "font": "Inter ExtraBold",
+        "color": "#FFFFFF",
+        "stroke": "#000000",
+        "stroke_width": 6,
+        "enter": "scale 0.8→1.0 + opacity 0→1",
+        "exit": "opacity 1→0"
+      }
+    },
+    {
+      "id": "zoom_punch",
+      "name": "Zoom Punch Cut",
+      "description": "Her sahne değişiminde %4 hızlı zoom-in + kısa beyaz flaş geçişi",
+      "engine": "remotion",
+      "params": {
+        "zoom": 1.04,
+        "zoom_duration_ms": 120,
+        "flash_opacity": 0.25
+      }
+    },
+    {
+      "id": "slide_up_stack",
+      "name": "Slide-Up Stack",
+      "description": "Sahneler alttan yukarı kayarak üst üste biner",
+      "engine": "remotion",
+      "params": {
+        "slide_ms": 350,
+        "easing": "cubic-in-out"
+      }
+    },
+    {
+      "id": "progress_bar",
+      "name": "Progress Bar Hook",
+      "description": "Üstte videonun ilerleme çubuğu; izleme tamamlama oranını artırır",
+      "engine": "remotion",
+      "params": {
+        "position": "top",
+        "height_px": 8,
+        "color": "#00F2EA"
+      }
+    }
+  ],
+  "subtitle_styles": [
+    {
+      "id": "karaoke_pop",
+      "name": "Karaoke Pop",
+      "description": "Okunan kelime vurgulanır (renk değişimi), diğerleri beyaz",
+      "params": { "active_color": "#FE2C55", "base_color": "#FFFFFF", "font_size": 64 }
+    },
+    {
+      "id": "clean_minimal",
+      "name": "Clean Minimal",
+      "description": "Alt-orta, siyah kontur, beyaz metin",
+      "params": { "base_color": "#FFFFFF", "stroke": "#000000", "font_size": 56 }
+    },
+    {
+      "id": "highlight_box",
+      "name": "Highlight Box",
+      "description": "Aktif kelime kutu içinde sarı zemin üstünde siyah metin",
+      "params": { "active_bg": "#FFD400", "active_color": "#111111", "font_size": 60 }
+    }
+  ]
+}
