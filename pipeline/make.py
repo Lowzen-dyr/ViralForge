@@ -1,132 +1,266 @@
 #!/usr/bin/env python3
 """
-ViralForge — Uçtan uca TikTok video üretim pipeline'ı.
+ViralForge — gerçekten çalışan TikTok video üretim pipeline'ı.
+
+Çalışır sistemler (hepsi ücretsiz, web/Codespaces uyumlu, CPU'da çalışır):
+  1. script  → LLM (GROQ_API_KEY varsa) veya hazır şablon fallback
+  2. voice   → edge-tts: gerçek MP3 + kelime zamanlı SRT altyazı
+  3. cover   → Pollinations: gerçek 1080x1920 kapak görseli (API key gerekmez)
+  4. edit    → ffmpeg: kapak görselinden 9:16 arka plan + hafif zoom
+  5. subtitle→ SRT'yi videoya gömer (force_style ile stil)
+  6. title   → LLM (varsa) veya şablon fallback + hashtag seti
+  7. publish → otomasyon RİSKLİDİR: videoyu elle yüklemeyi önerir (metadata hazır)
 
 Kullanım:
-    python pipeline/make.py --topic "<konu>" [--template kinetic_text]
-                            [--subtitle-style karaoke_pop] [--dry-run]
+  python pipeline/make.py --topic "gece rutinleri" [--voice tr-TR-AhmetNeural]
+                          [--dry-run] [--keep-open]
 
-Modüller (hepsi ücretsiz):
-    1. discover  → TikTok trend/hashtag taraması (TikTok-Api)
-    2. script    → LLM senaryo (agents/script-writer.md promptu)
-    3. voice     → edge-tts ile seslendirme
-    4. edit      → openshorts / OpenReels ile montaj
-    5. animate   → Remotion şablonu uygular (templates/)
-    6. subtitle  → Whisper transkripsiyon + stil
-    7. cover     → Pollinations kapak görseli
-    8. title     → LLM başlık (agents/title-writer.md)
-    9. publish   → social-auto-upload (opsiyonel, --publish bayrağı ile)
+Gereksinim: ffmpeg, edge-tts, pillow (install.sh hepsini kurar)
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "output"
-OUT.mkdir(exist_ok=True)
 
+# ---------------------------------------------------------------- yardımcılar
 
-def sh(cmd: list[str], dry: bool = False) -> None:
-    """Komutu çalıştır; dry-run modunda sadece yazdır."""
-    printable = " ".join(cmd)
-    print(f"[ViralForge] $ {printable}")
+def sh(cmd: list[str], dry: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+    printable = " ".join(str(c) for c in cmd)
+    print(f"  $ {printable}")
     if dry:
-        return
+        return subprocess.CompletedProcess(cmd, 0, "", "")
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    if check and result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         raise RuntimeError(f"Adım başarısız: {printable}")
+    return result
 
 
-def discover(topic: str, dry: bool) -> dict:
-    """Trend/hashtag verisi toplar; konu verilmişse sadeleştirilmiş çıktı döner."""
-    data = {"topic": topic, "hashtags": [], "sample_stats": {}}
-    (ROOT / "data").mkdir(exist_ok=True)
-    (ROOT / "data/discovered.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+def need_ffmpeg() -> None:
+    if sh(["ffmpeg", "-version"], check=True).returncode != 0:
+        raise RuntimeError("ffmpeg bulunamadı — install.sh çalıştırın")
+
+
+def http_get(url: str, dest: Path, dry: bool, tries: int = 3) -> None:
+    print(f"  ↓ {url[:100]}...")
+    if dry:
+        return
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:  # noqa: S310
+                f.write(r.read())
+            return
+        except Exception as e:  # noqa: BLE001 — ağ hatası bilgilendirmesi
+            print(f"  deneme {i + 1}/{tries} başarısız: {e}")
+            time.sleep(3)
+    raise RuntimeError(f"İndirilemedi: {url}")
+
+
+# ---------------------------------------------------------------- 1) senaryo
+
+SCRIPT_SYSTEM_PROMPT = (
+    "Sen bir TikTok senaryo yazarısın. Verilen konu için 30-45 saniyelik "
+    "(70-120 kelime) Türkçe bir senaryo yaz. İlk cümle güçlü bir hook olsun "
+    "(soru veya şaşırtıcı iddia). 3-4 kısa paragraf. Sonda izleyiciye yorum "
+    "yazmaya çağıran bir kapanış. SADECE senaryo metnini döndür, başlık yok."
+)
+
+
+def gen_script(topic: str, dry: bool) -> str:
+    """LLM (ücretsiz Groq tier) varsa gerçek senaryo; yoksa şablon."""
+    key = os.getenv("GROQ_API_KEY", "").strip()
+    if key and not dry:
+        payload = json.dumps({
+            "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            "temperature": 0.8,
+            "messages": [
+                {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Konu: {topic}"},
+            ],
+        }).encode()
+        req = urllib.request.Request(  # noqa: S310 — bilinen, kullanıcı tarafından sağlanmış endpoint
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=payload,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read())
+        text = data["choices"][0]["message"]["content"].strip()
+        print(f"[1] senaryo (LLM): {len(text)} karakter")
+        return text
+
+    text = (
+        f"{topic} hakkında bildiğin her şey yanlış olabilir. "
+        f"Çoğu insan {topic} konusunda en temel hataları yapıyor ve farkında bile değil. "
+        f"Birincisi: acele etmeyin — {topic} konusunda başarı küçük adımlardan geçer. "
+        f"İkincisi: taklit etmek yerine kendine özgü bir yön seç. "
+        f"Üçüncüsü ve en önemlisi: düzenli ol. Bir hafta deneyip bırakanlar değil, "
+        f"devam edenler kazanır. "
+        f"Sence de en zor kısım hangisi? Yorumlara yaz, en çok oylananı "
+        f"bir sonraki videoda işleyelim."
     )
-    # Gerçek entegrasyon: TikTok-Api (pip install TikTokApi)
-    # from TikTokApi import TikTokApi — kendi kurulumunuza göre bağlayın.
-    print(f"[discover] konu hazır: {topic} (TikTok-Api entegrasyon noktası)")
-    return data
+    print("[1] senaryo (şablon fallback — GROQ_API_KEY girilirse LLM kullanılır)")
+    return text
 
 
-def voice(text_path: Path, dry: bool) -> Path:
-    """edge-tts ile metni sese çevirir (ücretsiz, key gerekmez)."""
-    audio = OUT / "voice.mp3"
-    voice_name = os.getenv("EDGE_TTS_VOICE", "tr-TR-AhmetNeural")
-    sh(["edge-tts", "--voice", voice_name, "--file", str(text_path),
-        "--write-media", str(audio)], dry)
-    return audio
+# ---------------------------------------------------------------- 2) ses + SRT
+
+def gen_voice(text: str, dry: bool) -> tuple[Path, Path]:
+    """edge-tts: MP3 + kelime zamanlı SRT (ücretsiz, key gerekmez)."""
+    mp3, srt = OUT / "voice.mp3", OUT / "voice.srt"
+    voice = os.getenv("EDGE_TTS_VOICE", "tr-TR-AhmetNeural")
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
+                                      encoding="utf-8") as tf:
+        tf.write(text)
+        text_file = tf.name
+    try:
+        sh(["edge-tts", "--voice", voice, "--file", text_file,
+            "--write-media", str(mp3), "--write-subtitles", str(srt)], dry)
+    finally:
+        os.unlink(text_file)
+    print(f"[2] ses: {mp3.name} + altyazı: {srt.name} (edge-tts)")
+    return mp3, srt
 
 
-def cover(topic: str, dry: bool) -> Path:
-    """Pollinations ile 1080x1920 kapak görseli üretir (ücretsiz HTTP)."""
-    import urllib.parse
-    import urllib.request
+# ---------------------------------------------------------------- 3) kapak
 
+def gen_cover(topic: str, dry: bool) -> Path:
     prompt = urllib.parse.quote(
-        f"cinematic viral tiktok cover about {topic}, high contrast, bold subject"
+        f"cinematic vertical thumbnail about {topic}, high contrast, "
+        "dramatic lighting, bold focal subject, viral tiktok aesthetic"
     )
-    url = (
-        f"https://image.pollinations.ai/prompt/{prompt}"
-        "?width=1080&height=1920&nologo=true"
-    )
+    url = (f"https://image.pollinations.ai/prompt/{prompt}"
+           "?width=1080&height=1920&nologo=true&model=flux")
     img = OUT / "cover.png"
-    print(f"[cover] {url}")
-    if not dry:
-        urllib.request.urlretrieve(url, img)  # noqa: S310 (bilinen güvenilir endpoint)
+    http_get(url, img, dry)
+    print(f"[3] kapak: {img.name} (Pollinations)")
     return img
 
 
+# ---------------------------------------------------------------- 4) montaj
+
+def gen_video(cover: Path, mp3: Path, srt: Path, subtitle_style: str, dry: bool) -> Path:
+    """ffmpeg: kapak → 9:16 arka plan (hafif zoom) + ses + gömülü altyazı."""
+    raw = OUT / "video_raw.mp4"
+    final = OUT / "video_final.mp4"
+
+    # 4a) arka plan: ses uzunluğunda, yavaş zoom yapan 1080x1920 video
+    sh(["ffmpeg", "-y", "-loop", "1", "-i", str(cover), "-i", str(mp3),
+        "-filter_complex",
+        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,zoompan=z='min(1.0+0.0006*on,1.15)'"
+        ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30,"
+        "format=yuv420p[v]",
+        "-map", "[v]", "-map", "1:a", "-c:v", "libx264", "-preset", "fast",
+        "-c:a", "aac", "-b:a", "128k", "-shortest", str(raw)], dry)
+    print(f"[4] arka plan videosu: {raw.name} (ffmpeg zoompan)")
+
+    # 4b) altyazı gömme (ASS stil şablonu)
+    styles = {
+        "karaoke_pop": "FontName=DejaVu Sans,Fontsize=22,PrimaryColour=&H00FFFFFF,"
+                       "OutlineColour=&H00000000,Outline=3,Bold=1,Alignment=2,MarginV=60",
+        "clean_minimal": "FontName=DejaVu Sans,Fontsize=20,PrimaryColour=&H00FFFFFF,"
+                        "OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=40",
+        "highlight_box": "FontName=DejaVu Sans,Fontsize=22,PrimaryColour=&H00F5D400,"
+                         "OutlineColour=&H00000000,Outline=3,Bold=1,Alignment=2,MarginV=60",
+    }
+    style = styles.get(subtitle_style, styles["karaoke_pop"])
+    vf = f"subtitles={srt.name}:force_style='{style}'"
+    sh(["ffmpeg", "-y", "-i", str(raw), "-vf", vf,
+        "-c:v", "libx264", "-preset", "fast", "-c:a", "copy", str(final)], dry)
+    print(f"[5] altyazı gömüldü: {final.name} (stil: {subtitle_style})")
+    return final
+
+
+# ---------------------------------------------------------------- 6) başlık
+
+TITLE_SYSTEM_PROMPT = (
+    "Sen TikTok başlık uzmanısın. Verilen konu için: 1 başlık (max 90 karakter, "
+    "merak uyandıran), 4 alakalı hashtag (jenerik #fyp hariç). "
+    'Sadece JSON döndür: {"title": "...", "hashtags": ["#a","#b","#c","#d"]}'
+)
+
+
+def gen_title(topic: str, dry: bool) -> dict:
+    key = os.getenv("GROQ_API_KEY", "").strip()
+    meta = {"title": f"{topic} hakkında kimsenin söylemediği gerçek 👀",
+            "hashtags": [f"#{re.sub(r'[^a-z0-9ğüşıöç]', '', topic.lower())}",
+                         "#keşfet", "#bilgi", "#tiktoktürkiye"]}
+    if key and not dry:
+        try:
+            payload = json.dumps({
+                "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                "messages": [{"role": "system", "content": TITLE_SYSTEM_PROMPT},
+                             {"role": "user", "content": f"Konu: {topic}"}],
+            }).encode()
+            req = urllib.request.Request(  # noqa: S310
+                "https://api.groq.com/openai/v1/chat/completions", data=payload,
+                headers={"Authorization": f"Bearer {key}",
+                         "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.loads(r.read())
+            m = re.search(r"\{.*}", data["choices"][0]["message"]["content"],
+                          re.DOTALL)
+            if m:
+                meta = json.loads(m.group(0))
+        except Exception as e:  # noqa: BLE001
+            print(f"  LLM başlık başarısız, şablon kullanılıyor: {e}")
+    print(f"[6] başlık: {meta['title']}")
+    return meta
+
+
+# ---------------------------------------------------------------- main
+
 def main() -> int:
-    p = argparse.ArgumentParser(description="ViralForge pipeline")
+    p = argparse.ArgumentParser(description="ViralForge video pipeline")
     p.add_argument("--topic", required=True)
-    p.add_argument("--template", default="kinetic_text")
-    p.add_argument("--subtitle-style", default="karaoke_pop")
+    p.add_argument("--subtitle-style", default="karaoke_pop",
+                   choices=["karaoke_pop", "clean_minimal", "highlight_box"])
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--publish", action="store_true", help="TikTok'a yükle (social-auto-upload)")
     a = p.parse_args()
     dry = a.dry_run
 
+    OUT.mkdir(exist_ok=True)
     print("=== ViralForge /make ===")
-    data = discover(a.topic, dry)
-
-    # 2) script: agents/script-writer.md promptu ile LLM (ücretsiz tier)
-    script_path = OUT / "script.json"
-    print(f"[script] LLM senaryo adımı (agents/script-writer.md) → {script_path}")
-
-    # 3) voice
-    text_path = OUT / "script_text.txt"
-    print(f"[voice] edge-tts → {OUT / 'voice.mp3'}")
     if not dry:
-        text_path.write_text(
-            json.dumps({"topic": data["topic"]}, ensure_ascii=False), encoding="utf-8"
-        )
-        voice(text_path, dry)
+        need_ffmpeg()
 
-    # 4) edit + 5) animate + 6) subtitle
-    print(f"[edit] openshorts/OpenReels montaj → {OUT / 'video_raw.mp4'}")
-    print(f"[animate] Remotion şablonu: {a.template}")
-    print(f"[subtitle] Whisper + stil: {a.subtitle_style} → {OUT / 'video_final.mp4'}")
+    text = gen_script(a.topic, dry)
+    (OUT / "script_text.txt").write_text(text, encoding="utf-8")
+    mp3, srt = gen_voice(text, dry)
+    cover = gen_cover(a.topic, dry)
+    final = gen_video(cover, mp3, srt, a.subtitle_style, dry)
+    meta = gen_title(a.topic, dry)
+    (OUT / "metadata.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 7) cover
-    cover(a.topic, dry)
+    print("""
+=== BİTTİ ===
+Çıktılar (output/):
+  video_final.mp4  → TikTok'a yükleyeceğin video
+  cover.png        → kapak görseli
+  metadata.json    → başlık + hashtag (kopyala-yapıştır)
+  voice.mp3        → seslendirme
 
-    # 8) title
-    print(f"[title] LLM başlık (agents/title-writer.md) → {OUT / 'metadata.json'}")
-
-    # 9) publish
-    if a.publish:
-        print("[publish] social-auto-upload → TikTok (tarayıcı otomasyonu)")
-    else:
-        print("[publish] atlandı (--publish ile etkinleşir)")
-
-    print("=== bitti ===")
+Yükleme (önerilen, hesap güvenli):
+  TikTok @birihtimalofficial → Video yükle → video_final.mp4
+  → başlık ve hashtag'leri metadata.json'dan yapıştır
+Not: otomatik yükleme (social-auto-upload) TikTok kurallarını ihlal edip
+hesabını riske atabilir; bu yüzden varsayılan olarak önerilmiyor.
+""")
     return 0
 
 
